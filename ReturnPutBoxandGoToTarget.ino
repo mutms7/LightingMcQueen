@@ -255,12 +255,16 @@ void followLine(int leftIR, int rightIR) {
   bool rightOnWhite = (rightIR > WHITE_THRESHOLD);
   
   if (!leftOnWhite && !rightOnWhite) {
+    // Both on line - go straight
     moveForward(BASE_SPEED);
   } else if (leftOnWhite && !rightOnWhite) {
-    turnRight(TURN_SPEED);
+    // Left sees white - make small right correction
+    turnRightDegrees(5);
   } else if (!leftOnWhite && rightOnWhite) {
-    turnLeft(TURN_SPEED);
+    // Right sees white - make small left correction
+    turnLeftDegrees(5);
   } else {
+    // Both on white - lost line, move slowly
     moveForward(SLOW_SPEED);
   }
 }
@@ -320,7 +324,7 @@ void turnLeftDegrees(int degrees) {
   turnLeft(TURN_SPEED);
   delay(turnTime);
   stopMotors();
-  delay(100);
+  delay(50); // Short pause after turn
 }
 
 void turnRightDegrees(int degrees) {
@@ -329,7 +333,7 @@ void turnRightDegrees(int degrees) {
   turnRight(TURN_SPEED);
   delay(turnTime);
   stopMotors();
-  delay(100);
+  delay(50); // Short pause after turn
 }
 
 // ========== OBSTACLE AVOIDANCE ==========
@@ -344,6 +348,7 @@ void avoidObstacle() {
   Serial.println("Moving forward...");
   moveForward(BASE_SPEED);
   delay(800); // Move forward for a bit
+  stopMotors();
   
   Serial.println("Turning 90° right...");
   turnRightDegrees(90);
@@ -351,6 +356,7 @@ void avoidObstacle() {
   Serial.println("Moving forward...");
   moveForward(BASE_SPEED);
   delay(1000); // Move past obstacle
+  stopMotors();
   
   Serial.println("Turning 45° left to realign...");
   turnLeftDegrees(45);
