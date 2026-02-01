@@ -23,10 +23,11 @@
 #define TURN_SPEED 120
 #define SLOW_SPEED 100
 
-// Distance threshold for obstacle detection (in cm)
-#define OBSTACLE_DISTANCE 15
+// Distance thresholds
+#define WALL_DETECTION_MAX 100
+#define WALL_DETECTION_MIN 10
 
-// Color thresholds (calibrate these for your sensor)
+// Color thresholds
 #define BLACK_THRESHOLD 400
 #define WHITE_THRESHOLD 800
 #define RED_R_MIN 150
@@ -39,24 +40,21 @@
 #define GREEN_G_MIN 150
 #define GREEN_G_MAX 255
 #define GREEN_R_MAX 100
-#define GREY_MIN 300
-#define GREY_MAX 600
+
+#define CIRCLE_RADIUS 9.0
+#define TARGET_DISTANCE 18.0
 
 Servo gripperServo;
 
 enum RobotState {
-  FOLLOW_RED_WITH_OBSTACLES,
-  BLUE_PICKUP_SEQUENCE,
-  FOLLOW_RED_TO_BLACK,
-  TURN_TO_GREEN,
-  FOLLOW_GREEN_TO_BLUE,
-  GREEN_PICKUP_SEQUENCE,
-  FOLLOW_GREEN_AFTER_PICKUP,
-  FOLLOW_BLACK_TO_TARGET,
-  REACHED_TARGET
+  SCAN_FOR_WALL,
+  FIND_RED_LINE,
+  FOLLOW_RED_TO_OPPOSITE,
+  PUSH_BALL_TO_CENTER,
+  MISSION_COMPLETE
 };
 
-RobotState currentState = FOLLOW_RED_WITH_OBSTACLES;
+RobotState currentState = SCAN_FOR_WALL;
 
 struct Color {
   int red;
@@ -64,29 +62,34 @@ struct Color {
   int blue;
 };
 
+struct WallData {
+  int startAngle;
+  int endAngle;
+  int middleAngle;
+  bool detected;
+};
+
+WallData wallInfo = {0, 0, 0, false};
+float distanceTraveled = 0.0;
+
 void setup() {
   Serial.begin(9600);
   
-  // Initialize IR sensors
   pinMode(LEFT_IR_SENSOR, INPUT);
   pinMode(RIGHT_IR_SENSOR, INPUT);
   
-  // Initialize color sensor
   pinMode(COLOR_SENSOR_S0, OUTPUT);
   pinMode(COLOR_SENSOR_S1, OUTPUT);
   pinMode(COLOR_SENSOR_S2, OUTPUT);
   pinMode(COLOR_SENSOR_S3, OUTPUT);
   pinMode(COLOR_SENSOR_OUT, INPUT);
   
-  // Set frequency scaling to 20%
   digitalWrite(COLOR_SENSOR_S0, HIGH);
   digitalWrite(COLOR_SENSOR_S1, LOW);
   
-  // Initialize ultrasonic sensor
   pinMode(ULTRASONIC_TRIG, OUTPUT);
   pinMode(ULTRASONIC_ECHO, INPUT);
   
-  // Initialize motors
   pinMode(LEFT_MOTOR_PWM, OUTPUT);
   pinMode(LEFT_MOTOR_DIR1, OUTPUT);
   pinMode(LEFT_MOTOR_DIR2, OUTPUT);
@@ -94,103 +97,62 @@ void setup() {
   pinMode(RIGHT_MOTOR_DIR1, OUTPUT);
   pinMode(RIGHT_MOTOR_DIR2, OUTPUT);
   
-  // Initialize servo
   gripperServo.attach(SERVO_PIN);
-  gripperServo.write(90); // Initial position
+  gripperServo.write(90);
   
   delay(2000);
-  Serial.println("Robot initialized!");
+  Serial.println("Wall Detection Module Initialized!");
 }
 
 void loop() {
   Color detectedColor = readColor();
   int leftIR = analogRead(LEFT_IR_SENSOR);
   int rightIR = analogRead(RIGHT_IR_SENSOR);
-  int distance = getDistance();
   
-  // Debug output
   Serial.print("State: ");
-  Serial.print(currentState);
-  Serial.print(" | Distance: ");
-  Serial.println(distance);
+  Serial.println(currentState);
   
   switch(currentState) {
-    case FOLLOW_RED_WITH_OBSTACLES:
-      if (isBlue(detectedColor)) {
-        Serial.println("Blue detected! Starting pickup sequence.");
-        currentState = BLUE_PICKUP_SEQUENCE;
-        bluePickupSequence();
-      } else if (distance < OBSTACLE_DISTANCE && distance > 0) {
-        Serial.println("Obstacle detected! Avoiding...");
-        avoidObstacle();
+    case SCAN_FOR_WALL:
+      scanForWall();
+      if (wallInfo.detected) {
+        Serial.print("Wall detected! Middle angle: ");
+        Serial.println(wallInfo.middleAngle);
+        currentState = FIND_RED_LINE;
+      }
+      break;
+      
+    case FIND_RED_LINE:
+      findAndAlignToRedLine();
+      currentState = FOLLOW_RED_TO_OPPOSITE;
+      distanceTraveled = 0.0;
+      break;
+      
+    case FOLLOW_RED_TO_OPPOSITE:
+      if (isRed(detectedColor) || isBlack(detectedColor)) {
+        followLineAndTrackDistance(leftIR, rightIR);
+        
+        if (distanceTraveled >= TARGET_DISTANCE) {
+          Serial.println("Reached opposite side of wall!");
+          stopMotors();
+          delay(500);
+          currentState = PUSH_BALL_TO_CENTER;
+        }
       } else {
         followLine(leftIR, rightIR);
       }
       break;
       
-    case BLUE_PICKUP_SEQUENCE:
-      // This state is handled by the function call above
-      // Transition happens inside bluePickupSequence()
-      currentState = FOLLOW_RED_TO_BLACK;
+    case PUSH_BALL_TO_CENTER:
+      pushBallToCenter();
+      currentState = MISSION_COMPLETE;
       break;
       
-    case FOLLOW_RED_TO_BLACK:
-      if (isBlack(detectedColor)) {
-        Serial.println("Black detected! Turning to green line.");
-        currentState = TURN_TO_GREEN;
-        turnToGreen();
-      } else {
-        followLine(leftIR, rightIR);
-      }
-      break;
-      
-    case TURN_TO_GREEN:
-      // This state is handled by turnToGreen() function
-      currentState = FOLLOW_GREEN_TO_BLUE;
-      break;
-      
-    case FOLLOW_GREEN_TO_BLUE:
-      if (isBlue(detectedColor)) {
-        Serial.println("Blue detected on green path! Starting green pickup.");
-        currentState = GREEN_PICKUP_SEQUENCE;
-        greenPickupSequence();
-      } else {
-        followLine(leftIR, rightIR);
-      }
-      break;
-      
-    case GREEN_PICKUP_SEQUENCE:
-      // Handled by greenPickupSequence() function
-      currentState = FOLLOW_GREEN_AFTER_PICKUP;
-      break;
-      
-    case FOLLOW_GREEN_AFTER_PICKUP:
-      if (isBlack(detectedColor)) {
-        Serial.println("Black detected after green! Switching to black line.");
-        currentState = FOLLOW_BLACK_TO_TARGET;
-        delay(200);
-      } else {
-        followLine(leftIR, rightIR);
-      }
-      break;
-      
-    case FOLLOW_BLACK_TO_TARGET:
-      if (isBlue(detectedColor)) {
-        Serial.println("Blue target detected! Moving to target.");
-        moveForward(BASE_SPEED);
-        delay(500); // Move forward a bit
-        stopMotors();
-        currentState = REACHED_TARGET;
-      } else {
-        followLine(leftIR, rightIR);
-      }
-      break;
-      
-    case REACHED_TARGET:
+    case MISSION_COMPLETE:
       stopMotors();
-      Serial.println("Mission complete! Target reached.");
+      Serial.println("Ball pushed to wall! Mission complete.");
       while(true) {
-        delay(1000); // Stop forever
+        delay(1000);
       }
       break;
   }
@@ -198,24 +160,191 @@ void loop() {
   delay(10);
 }
 
+// ========== WALL DETECTION ==========
+
+void scanForWall() {
+  Serial.println("=== SCANNING 360° FOR WALL ===");
+  
+  stopMotors();
+  delay(500);
+  
+  int currentAngle = 0;
+  bool inWall = false;
+  int wallStartAngle = -1;
+  int wallEndAngle = -1;
+  
+  while (currentAngle < 360) {
+    turnRightDegrees(1);
+    currentAngle++;
+    
+    int distance = getDistance();
+    bool seeingWall = (distance > WALL_DETECTION_MIN && distance < WALL_DETECTION_MAX);
+    
+    if (seeingWall && !inWall) {
+      wallStartAngle = currentAngle;
+      inWall = true;
+      Serial.print("Wall start detected at angle: ");
+      Serial.println(currentAngle);
+    } else if (!seeingWall && inWall) {
+      wallEndAngle = currentAngle - 1;
+      inWall = false;
+      Serial.print("Wall end detected at angle: ");
+      Serial.println(wallEndAngle);
+      
+      int wallSpan = wallEndAngle - wallStartAngle;
+      if (wallSpan > 5) {
+        wallInfo.startAngle = wallStartAngle;
+        wallInfo.endAngle = wallEndAngle;
+        wallInfo.middleAngle = wallStartAngle + (wallSpan / 2);
+        wallInfo.detected = true;
+        
+        Serial.print("Wall span: ");
+        Serial.print(wallSpan);
+        Serial.println(" degrees");
+        
+        break;
+      }
+    }
+    
+    delay(50);
+  }
+  
+  if (!wallInfo.detected) {
+    Serial.println("Warning: No wall detected in 360° scan!");
+  }
+}
+
+void findAndAlignToRedLine() {
+  Serial.println("=== FINDING RED LINE ===");
+  
+  stopMotors();
+  delay(300);
+  
+  int targetAngle = (wallInfo.middleAngle + 180) % 360;
+  
+  Serial.print("Turning away from wall to angle: ");
+  Serial.println(targetAngle);
+  
+  turnRightDegrees(targetAngle);
+  
+  Serial.println("Searching for red line...");
+  moveForward(BASE_SPEED);
+  
+  unsigned long startTime = millis();
+  bool redFound = false;
+  
+  while (millis() - startTime < 8000 && !redFound) {
+    Color c = readColor();
+    if (isRed(c)) {
+      redFound = true;
+      stopMotors();
+      Serial.println("Red line found!");
+      delay(300);
+      
+      Serial.println("Aligning to follow red line...");
+      turnLeftDegrees(90);
+    }
+    delay(50);
+  }
+  
+  if (!redFound) {
+    Serial.println("Warning: Red line not found! Trying alternative search...");
+    stopMotors();
+    for (int i = 0; i < 8; i++) {
+      turnLeftDegrees(45);
+      delay(200);
+      Color c = readColor();
+      if (isRed(c)) {
+        Serial.println("Red line found during rotation!");
+        turnLeftDegrees(90);
+        break;
+      }
+    }
+  }
+}
+
+void followLineAndTrackDistance(int leftIR, int rightIR) {
+  static unsigned long lastTime = millis();
+  unsigned long currentTime = millis();
+  float deltaTime = (currentTime - lastTime) / 1000.0;
+  
+  bool leftOnWhite = (leftIR > WHITE_THRESHOLD);
+  bool rightOnWhite = (rightIR > WHITE_THRESHOLD);
+  
+  if (!leftOnWhite && !rightOnWhite) {
+    // Both on line - keep going straight!
+    moveForward(BASE_SPEED);
+    distanceTraveled += 10.0 * deltaTime;
+  } else if (leftOnWhite && !rightOnWhite) {
+    // Turn right until back on line
+    while (leftOnWhite) {
+      turnRightDegrees(5);
+      leftIR = analogRead(LEFT_IR_SENSOR);
+      leftOnWhite = (leftIR > WHITE_THRESHOLD);
+    }
+  } else if (!leftOnWhite && rightOnWhite) {
+    // Turn left until back on line
+    while (rightOnWhite) {
+      turnLeftDegrees(5);
+      rightIR = analogRead(RIGHT_IR_SENSOR);
+      rightOnWhite = (rightIR > WHITE_THRESHOLD);
+    }
+  } else {
+    moveForward(SLOW_SPEED);
+    distanceTraveled += 5.0 * deltaTime;
+  }
+  
+  lastTime = currentTime;
+  
+  if ((int)distanceTraveled % 2 == 0) {
+    Serial.print("Distance traveled: ");
+    Serial.print(distanceTraveled);
+    Serial.println(" cm");
+  }
+}
+
+void pushBallToCenter() {
+  Serial.println("=== PUSHING BALL TO CENTER ===");
+  
+  stopMotors();
+  delay(500);
+  
+  Serial.println("Turning toward center...");
+  turnLeftDegrees(90);
+  
+  delay(300);
+  
+  Serial.println("Moving to push ball...");
+  moveForward(BASE_SPEED);
+  delay(2000);
+  
+  stopMotors();
+  Serial.println("Ball should be pushed toward wall!");
+  
+  delay(500);
+  
+  Serial.println("Backing up...");
+  moveBackward(BASE_SPEED);
+  delay(1000);
+  
+  stopMotors();
+}
+
 // ========== COLOR SENSING FUNCTIONS ==========
 
 Color readColor() {
   Color c;
   
-  // Read RED
   digitalWrite(COLOR_SENSOR_S2, LOW);
   digitalWrite(COLOR_SENSOR_S3, LOW);
   c.red = pulseIn(COLOR_SENSOR_OUT, LOW);
   delay(10);
   
-  // Read GREEN
   digitalWrite(COLOR_SENSOR_S2, HIGH);
   digitalWrite(COLOR_SENSOR_S3, HIGH);
   c.green = pulseIn(COLOR_SENSOR_OUT, LOW);
   delay(10);
   
-  // Read BLUE
   digitalWrite(COLOR_SENSOR_S2, LOW);
   digitalWrite(COLOR_SENSOR_S3, HIGH);
   c.blue = pulseIn(COLOR_SENSOR_OUT, LOW);
@@ -243,11 +372,6 @@ bool isBlack(Color c) {
   return (avg < BLACK_THRESHOLD);
 }
 
-bool isGrey(Color c) {
-  int avg = (c.red + c.green + c.blue) / 3;
-  return (avg > GREY_MIN && avg < GREY_MAX);
-}
-
 // ========== MOVEMENT FUNCTIONS ==========
 
 void followLine(int leftIR, int rightIR) {
@@ -255,16 +379,23 @@ void followLine(int leftIR, int rightIR) {
   bool rightOnWhite = (rightIR > WHITE_THRESHOLD);
   
   if (!leftOnWhite && !rightOnWhite) {
-    // Both on line - go straight
+    // Both on line - keep going straight!
     moveForward(BASE_SPEED);
   } else if (leftOnWhite && !rightOnWhite) {
-    // Left sees white - make small right correction
-    turnRightDegrees(5);
+    // Turn right until back on line
+    while (leftOnWhite) {
+      turnRightDegrees(5);
+      leftIR = analogRead(LEFT_IR_SENSOR);
+      leftOnWhite = (leftIR > WHITE_THRESHOLD);
+    }
   } else if (!leftOnWhite && rightOnWhite) {
-    // Right sees white - make small left correction
-    turnLeftDegrees(5);
+    // Turn left until back on line
+    while (rightOnWhite) {
+      turnLeftDegrees(5);
+      rightIR = analogRead(RIGHT_IR_SENSOR);
+      rightOnWhite = (rightIR > WHITE_THRESHOLD);
+    }
   } else {
-    // Both on white - lost line, move slowly
     moveForward(SLOW_SPEED);
   }
 }
@@ -317,163 +448,21 @@ void stopMotors() {
 // ========== ANGLE-BASED TURNING FUNCTIONS ==========
 
 void turnLeftDegrees(int degrees) {
-  // Approximate timing for degree-based turns
-  // Calibrate this value based on your robot's turn speed
-  int turnTime = degrees * 10; // 10ms per degree (adjust as needed)
+  int turnTime = degrees * 10;
   
   turnLeft(TURN_SPEED);
   delay(turnTime);
   stopMotors();
-  delay(50); // Short pause after turn
+  delay(50);
 }
 
 void turnRightDegrees(int degrees) {
-  int turnTime = degrees * 10; // 10ms per degree (adjust as needed)
+  int turnTime = degrees * 10;
   
   turnRight(TURN_SPEED);
   delay(turnTime);
   stopMotors();
-  delay(50); // Short pause after turn
-}
-
-// ========== OBSTACLE AVOIDANCE ==========
-
-void avoidObstacle() {
-  stopMotors();
-  delay(200);
-  
-  Serial.println("Turning 45° left...");
-  turnLeftDegrees(45);
-  
-  Serial.println("Moving forward...");
-  moveForward(BASE_SPEED);
-  delay(800); // Move forward for a bit
-  stopMotors();
-  
-  Serial.println("Turning 90° right...");
-  turnRightDegrees(90);
-  
-  Serial.println("Moving forward...");
-  moveForward(BASE_SPEED);
-  delay(1000); // Move past obstacle
-  stopMotors();
-  
-  Serial.println("Turning 45° left to realign...");
-  turnLeftDegrees(45);
-  
-  Serial.println("Obstacle avoided! Resuming line following.");
-}
-
-// ========== PICKUP SEQUENCES ==========
-
-void bluePickupSequence() {
-  Serial.println("=== BLUE PICKUP SEQUENCE ===");
-  
-  stopMotors();
-  delay(300);
-  
-  // Turn 90 degrees left
-  Serial.println("Turning 90° left...");
-  turnLeftDegrees(90);
-  
-  // Move forward a little bit
-  Serial.println("Moving forward...");
-  moveForward(BASE_SPEED);
-  delay(600);
-  stopMotors();
-  delay(200);
-  
-  // Unrotate servo 40 degrees (clockwise)
-  Serial.println("Releasing object (servo +40°)...");
-  int currentPos = gripperServo.read();
-  gripperServo.write(currentPos + 40);
-  delay(800);
-  
-  // Move backwards
-  Serial.println("Moving backward...");
-  moveBackward(BASE_SPEED);
-  delay(600);
-  stopMotors();
-  delay(200);
-  
-  // Turn 90 degrees right
-  Serial.println("Turning 90° right...");
-  turnRightDegrees(90);
-  
-  Serial.println("Blue pickup complete!");
-  delay(300);
-}
-
-void greenPickupSequence() {
-  Serial.println("=== GREEN PICKUP SEQUENCE ===");
-  
-  stopMotors();
-  delay(300);
-  
-  // Rotate servo 40 degrees counterclockwise
-  Serial.println("Grabbing object (servo -40°)...");
-  int currentPos = gripperServo.read();
-  gripperServo.write(currentPos - 40);
-  delay(800);
-  
-  // Turn 110 degrees left
-  Serial.println("Turning 110° left...");
-  turnLeftDegrees(110);
-  
-  // Unrotate servo 40 degrees (clockwise)
-  Serial.println("Releasing object (servo +40°)...");
-  currentPos = gripperServo.read();
-  gripperServo.write(currentPos + 40);
-  delay(800);
-  
-  // Back up
-  Serial.println("Backing up...");
-  moveBackward(BASE_SPEED);
-  delay(600);
-  stopMotors();
-  delay(200);
-  
-  // Rotate 110 degrees right
-  Serial.println("Turning 110° right...");
-  turnRightDegrees(110);
-  
-  Serial.println("Green pickup complete!");
-  delay(300);
-}
-
-void turnToGreen() {
-  Serial.println("=== TURNING TO GREEN LINE ===");
-  
-  stopMotors();
-  delay(200);
-  
-  // Turn 90 degrees left
-  Serial.println("Turning 90° left to find green...");
-  turnLeftDegrees(90);
-  
-  // Move forward until green is detected
-  Serial.println("Moving forward to find green line...");
-  moveForward(BASE_SPEED);
-  
-  unsigned long startTime = millis();
-  bool greenFound = false;
-  
-  while (millis() - startTime < 5000 && !greenFound) { // 5 second timeout
-    Color c = readColor();
-    if (isGreen(c)) {
-      greenFound = true;
-      stopMotors();
-      Serial.println("Green line found!");
-    }
-    delay(50);
-  }
-  
-  if (!greenFound) {
-    Serial.println("Warning: Green line not found in 5 seconds!");
-    stopMotors();
-  }
-  
-  delay(300);
+  delay(50);
 }
 
 // ========== ULTRASONIC SENSOR ==========
@@ -485,10 +474,10 @@ int getDistance() {
   delayMicroseconds(10);
   digitalWrite(ULTRASONIC_TRIG, LOW);
   
-  long duration = pulseIn(ULTRASONIC_ECHO, HIGH, 30000); // 30ms timeout
+  long duration = pulseIn(ULTRASONIC_ECHO, HIGH, 30000);
   
   if (duration == 0) {
-    return -1; // No echo received
+    return -1;
   }
   
   int distance = duration * 0.034 / 2;
