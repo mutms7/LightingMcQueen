@@ -23,7 +23,11 @@
 #define TURN_SPEED 120
 #define SLOW_SPEED 100
 
-// Color thresholds (calibrate these for your sensor)
+// Distance thresholds
+#define WALL_DETECTION_MAX 100
+#define WALL_DETECTION_MIN 10
+
+// Color thresholds
 #define BLACK_THRESHOLD 400
 #define WHITE_THRESHOLD 800
 #define RED_R_MIN 150
@@ -33,19 +37,24 @@
 #define BLUE_B_MIN 150
 #define BLUE_B_MAX 255
 #define BLUE_R_MAX 100
-#define GREY_MIN 300
-#define GREY_MAX 600
+#define GREEN_G_MIN 150
+#define GREEN_G_MAX 255
+#define GREEN_R_MAX 100
+
+#define CIRCLE_RADIUS 9.0
+#define TARGET_DISTANCE 18.0
 
 Servo gripperServo;
 
 enum RobotState {
-  FOLLOW_BLACK,
-  FOLLOW_RED,
-  REACHED_GREY
+  SCAN_FOR_WALL,
+  FIND_RED_LINE,
+  FOLLOW_RED_TO_OPPOSITE,
+  PUSH_BALL_TO_CENTER,
+  MISSION_COMPLETE
 };
 
-RobotState currentState = FOLLOW_BLACK;
-bool blueDetected = false;
+RobotState currentState = SCAN_FOR_WALL;
 
 struct Color {
   int red;
@@ -53,29 +62,34 @@ struct Color {
   int blue;
 };
 
+struct WallData {
+  int startAngle;
+  int endAngle;
+  int middleAngle;
+  bool detected;
+};
+
+WallData wallInfo = {0, 0, 0, false};
+float distanceTraveled = 0.0;
+
 void setup() {
   Serial.begin(9600);
   
-  // Initialize IR sensors
   pinMode(LEFT_IR_SENSOR, INPUT);
   pinMode(RIGHT_IR_SENSOR, INPUT);
   
-  // Initialize color sensor
   pinMode(COLOR_SENSOR_S0, OUTPUT);
   pinMode(COLOR_SENSOR_S1, OUTPUT);
   pinMode(COLOR_SENSOR_S2, OUTPUT);
   pinMode(COLOR_SENSOR_S3, OUTPUT);
   pinMode(COLOR_SENSOR_OUT, INPUT);
   
-  // Set frequency scaling to 20%
   digitalWrite(COLOR_SENSOR_S0, HIGH);
   digitalWrite(COLOR_SENSOR_S1, LOW);
   
-  // Initialize ultrasonic sensor
   pinMode(ULTRASONIC_TRIG, OUTPUT);
   pinMode(ULTRASONIC_ECHO, INPUT);
   
-  // Initialize motors
   pinMode(LEFT_MOTOR_PWM, OUTPUT);
   pinMode(LEFT_MOTOR_DIR1, OUTPUT);
   pinMode(LEFT_MOTOR_DIR2, OUTPUT);
@@ -83,12 +97,11 @@ void setup() {
   pinMode(RIGHT_MOTOR_DIR1, OUTPUT);
   pinMode(RIGHT_MOTOR_DIR2, OUTPUT);
   
-  // Initialize servo
   gripperServo.attach(SERVO_PIN);
-  gripperServo.write(90); // Initial position
+  gripperServo.write(90);
   
-  delay(2000); // Startup delay
-  Serial.println("Robot initialized!");
+  delay(2000);
+  Serial.println("Wall Detection Module Initialized!");
 }
 
 void loop() {
@@ -96,68 +109,242 @@ void loop() {
   int leftIR = analogRead(LEFT_IR_SENSOR);
   int rightIR = analogRead(RIGHT_IR_SENSOR);
   
-  // State machine
+  Serial.print("State: ");
+  Serial.println(currentState);
+  
   switch(currentState) {
-    case FOLLOW_BLACK:
-      // Check if red is detected to transition
-      if (isRed(detectedColor)) {
-        Serial.println("Red detected! Switching to red line following.");
-        currentState = FOLLOW_RED;
-        delay(200);
+    case SCAN_FOR_WALL:
+      scanForWall();
+      if (wallInfo.detected) {
+        Serial.print("Wall detected! Middle angle: ");
+        Serial.println(wallInfo.middleAngle);
+        currentState = FIND_RED_LINE;
+      }
+      break;
+      
+    case FIND_RED_LINE:
+      findAndAlignToRedLine();
+      currentState = FOLLOW_RED_TO_OPPOSITE;
+      distanceTraveled = 0.0;
+      break;
+      
+    case FOLLOW_RED_TO_OPPOSITE:
+      if (isRed(detectedColor) || isBlack(detectedColor)) {
+        followLineAndTrackDistance(leftIR, rightIR);
+        
+        if (distanceTraveled >= TARGET_DISTANCE) {
+          Serial.println("Reached opposite side of wall!");
+          stopMotors();
+          delay(500);
+          currentState = PUSH_BALL_TO_CENTER;
+        }
       } else {
         followLine(leftIR, rightIR);
       }
       break;
       
-    case FOLLOW_RED:
-      // Check for blue to rotate servo
-      if (isBlue(detectedColor) && !blueDetected) {
-        Serial.println("Blue detected! Rotating servo.");
-        rotateServo();
-        blueDetected = true;
-        delay(500);
-      }
-      
-      // Check for grey to stop
-      if (isGrey(detectedColor)) {
-        Serial.println("Grey detected! Stopping at reupload point.");
-        stopMotors();
-        currentState = REACHED_GREY;
-        delay(1000);
-      } else {
-        followLine(leftIR, rightIR);
-      }
+    case PUSH_BALL_TO_CENTER:
+      pushBallToCenter();
+      currentState = MISSION_COMPLETE;
       break;
       
-    case REACHED_GREY:
+    case MISSION_COMPLETE:
       stopMotors();
-      Serial.println("Waiting at reupload point...");
-      delay(5000);
-      // You can add code here to wait for new instructions
+      Serial.println("Ball pushed to wall! Mission complete.");
+      while(true) {
+        delay(1000);
+      }
       break;
   }
   
   delay(10);
 }
 
+// ========== WALL DETECTION ==========
+
+void scanForWall() {
+  Serial.println("=== SCANNING 360° FOR WALL ===");
+  
+  stopMotors();
+  delay(500);
+  
+  int currentAngle = 0;
+  bool inWall = false;
+  int wallStartAngle = -1;
+  int wallEndAngle = -1;
+  
+  while (currentAngle < 360) {
+    turnRightDegrees(1);
+    currentAngle++;
+    
+    int distance = getDistance();
+    bool seeingWall = (distance > WALL_DETECTION_MIN && distance < WALL_DETECTION_MAX);
+    
+    if (seeingWall && !inWall) {
+      wallStartAngle = currentAngle;
+      inWall = true;
+      Serial.print("Wall start detected at angle: ");
+      Serial.println(currentAngle);
+    } else if (!seeingWall && inWall) {
+      wallEndAngle = currentAngle - 1;
+      inWall = false;
+      Serial.print("Wall end detected at angle: ");
+      Serial.println(wallEndAngle);
+      
+      int wallSpan = wallEndAngle - wallStartAngle;
+      if (wallSpan > 5) {
+        wallInfo.startAngle = wallStartAngle;
+        wallInfo.endAngle = wallEndAngle;
+        wallInfo.middleAngle = wallStartAngle + (wallSpan / 2);
+        wallInfo.detected = true;
+        
+        Serial.print("Wall span: ");
+        Serial.print(wallSpan);
+        Serial.println(" degrees");
+        
+        break;
+      }
+    }
+    
+    delay(50);
+  }
+  
+  if (!wallInfo.detected) {
+    Serial.println("Warning: No wall detected in 360° scan!");
+  }
+}
+
+void findAndAlignToRedLine() {
+  Serial.println("=== FINDING RED LINE ===");
+  
+  stopMotors();
+  delay(300);
+  
+  int targetAngle = (wallInfo.middleAngle + 180) % 360;
+  
+  Serial.print("Turning away from wall to angle: ");
+  Serial.println(targetAngle);
+  
+  turnRightDegrees(targetAngle);
+  
+  Serial.println("Searching for red line...");
+  moveForward(BASE_SPEED);
+  
+  unsigned long startTime = millis();
+  bool redFound = false;
+  
+  while (millis() - startTime < 8000 && !redFound) {
+    Color c = readColor();
+    if (isRed(c)) {
+      redFound = true;
+      stopMotors();
+      Serial.println("Red line found!");
+      delay(300);
+      
+      Serial.println("Aligning to follow red line...");
+      turnLeftDegrees(90);
+    }
+    delay(50);
+  }
+  
+  if (!redFound) {
+    Serial.println("Warning: Red line not found! Trying alternative search...");
+    stopMotors();
+    for (int i = 0; i < 8; i++) {
+      turnLeftDegrees(45);
+      delay(200);
+      Color c = readColor();
+      if (isRed(c)) {
+        Serial.println("Red line found during rotation!");
+        turnLeftDegrees(90);
+        break;
+      }
+    }
+  }
+}
+
+void followLineAndTrackDistance(int leftIR, int rightIR) {
+  static unsigned long lastTime = millis();
+  unsigned long currentTime = millis();
+  float deltaTime = (currentTime - lastTime) / 1000.0;
+  
+  bool leftOnWhite = (leftIR > WHITE_THRESHOLD);
+  bool rightOnWhite = (rightIR > WHITE_THRESHOLD);
+  
+  if (!leftOnWhite && !rightOnWhite) {
+    // Both on line - keep going straight!
+    moveForward(BASE_SPEED);
+    distanceTraveled += 10.0 * deltaTime;
+  } else if (leftOnWhite && !rightOnWhite) {
+    // Turn right until back on line
+    while (leftOnWhite) {
+      turnRightDegrees(5);
+      leftIR = analogRead(LEFT_IR_SENSOR);
+      leftOnWhite = (leftIR > WHITE_THRESHOLD);
+    }
+  } else if (!leftOnWhite && rightOnWhite) {
+    // Turn left until back on line
+    while (rightOnWhite) {
+      turnLeftDegrees(5);
+      rightIR = analogRead(RIGHT_IR_SENSOR);
+      rightOnWhite = (rightIR > WHITE_THRESHOLD);
+    }
+  } else {
+    moveForward(SLOW_SPEED);
+    distanceTraveled += 5.0 * deltaTime;
+  }
+  
+  lastTime = currentTime;
+  
+  if ((int)distanceTraveled % 2 == 0) {
+    Serial.print("Distance traveled: ");
+    Serial.print(distanceTraveled);
+    Serial.println(" cm");
+  }
+}
+
+void pushBallToCenter() {
+  Serial.println("=== PUSHING BALL TO CENTER ===");
+  
+  stopMotors();
+  delay(500);
+  
+  Serial.println("Turning toward center...");
+  turnLeftDegrees(90);
+  
+  delay(300);
+  
+  Serial.println("Moving to push ball...");
+  moveForward(BASE_SPEED);
+  delay(2000);
+  
+  stopMotors();
+  Serial.println("Ball should be pushed toward wall!");
+  
+  delay(500);
+  
+  Serial.println("Backing up...");
+  moveBackward(BASE_SPEED);
+  delay(1000);
+  
+  stopMotors();
+}
+
+// ========== COLOR SENSING FUNCTIONS ==========
+
 Color readColor() {
   Color c;
   
-  // Read RED
   digitalWrite(COLOR_SENSOR_S2, LOW);
   digitalWrite(COLOR_SENSOR_S3, LOW);
   c.red = pulseIn(COLOR_SENSOR_OUT, LOW);
-  
   delay(10);
   
-  // Read GREEN
   digitalWrite(COLOR_SENSOR_S2, HIGH);
   digitalWrite(COLOR_SENSOR_S3, HIGH);
   c.green = pulseIn(COLOR_SENSOR_OUT, LOW);
-  
   delay(10);
   
-  // Read BLUE
   digitalWrite(COLOR_SENSOR_S2, LOW);
   digitalWrite(COLOR_SENSOR_S3, HIGH);
   c.blue = pulseIn(COLOR_SENSOR_OUT, LOW);
@@ -175,35 +362,40 @@ bool isBlue(Color c) {
           c.red < BLUE_R_MAX);
 }
 
-bool isGrey(Color c) {
-  int avg = (c.red + c.green + c.blue) / 3;
-  return (avg > GREY_MIN && avg < GREY_MAX);
+bool isGreen(Color c) {
+  return (c.green > GREEN_G_MIN && c.green < GREEN_G_MAX && 
+          c.red < GREEN_R_MAX && c.blue < GREEN_R_MAX);
 }
 
+bool isBlack(Color c) {
+  int avg = (c.red + c.green + c.blue) / 3;
+  return (avg < BLACK_THRESHOLD);
+}
+
+// ========== MOVEMENT FUNCTIONS ==========
+
 void followLine(int leftIR, int rightIR) {
-  // White surface = high value, Black line = low value
   bool leftOnWhite = (leftIR > WHITE_THRESHOLD);
   bool rightOnWhite = (rightIR > WHITE_THRESHOLD);
   
   if (!leftOnWhite && !rightOnWhite) {
-    // Both sensors on the line - keep going straight continuously!
+    // Both on line - keep going straight!
     moveForward(BASE_SPEED);
   } else if (leftOnWhite && !rightOnWhite) {
-    // Left sees white - turn right until back on line
+    // Turn right until back on line
     while (leftOnWhite) {
       turnRightDegrees(5);
       leftIR = analogRead(LEFT_IR_SENSOR);
       leftOnWhite = (leftIR > WHITE_THRESHOLD);
     }
   } else if (!leftOnWhite && rightOnWhite) {
-    // Right sees white - turn left until back on line
+    // Turn left until back on line
     while (rightOnWhite) {
       turnLeftDegrees(5);
       rightIR = analogRead(RIGHT_IR_SENSOR);
       rightOnWhite = (rightIR > WHITE_THRESHOLD);
     }
   } else {
-    // Both on white - lost line, move slowly
     moveForward(SLOW_SPEED);
   }
 }
@@ -213,6 +405,15 @@ void moveForward(int speed) {
   digitalWrite(LEFT_MOTOR_DIR2, LOW);
   digitalWrite(RIGHT_MOTOR_DIR1, HIGH);
   digitalWrite(RIGHT_MOTOR_DIR2, LOW);
+  analogWrite(LEFT_MOTOR_PWM, speed);
+  analogWrite(RIGHT_MOTOR_PWM, speed);
+}
+
+void moveBackward(int speed) {
+  digitalWrite(LEFT_MOTOR_DIR1, LOW);
+  digitalWrite(LEFT_MOTOR_DIR2, HIGH);
+  digitalWrite(RIGHT_MOTOR_DIR1, LOW);
+  digitalWrite(RIGHT_MOTOR_DIR2, HIGH);
   analogWrite(LEFT_MOTOR_PWM, speed);
   analogWrite(RIGHT_MOTOR_PWM, speed);
 }
@@ -244,36 +445,27 @@ void stopMotors() {
   analogWrite(RIGHT_MOTOR_PWM, 0);
 }
 
+// ========== ANGLE-BASED TURNING FUNCTIONS ==========
+
 void turnLeftDegrees(int degrees) {
-  int turnTime = degrees * 10; // 10ms per degree (adjust as needed)
+  int turnTime = degrees * 10;
   
   turnLeft(TURN_SPEED);
   delay(turnTime);
   stopMotors();
-  delay(50); // Short pause after turn
+  delay(50);
 }
 
 void turnRightDegrees(int degrees) {
-  int turnTime = degrees * 10; // 10ms per degree (adjust as needed)
+  int turnTime = degrees * 10;
   
   turnRight(TURN_SPEED);
   delay(turnTime);
   stopMotors();
-  delay(50); // Short pause after turn
+  delay(50);
 }
 
-void rotateServo() {
-  int currentPos = gripperServo.read();
-  int targetPos = currentPos - 40; // 40 degrees counterclockwise
-  
-  if (targetPos < 0) targetPos = 0;
-  
-  gripperServo.write(targetPos);
-  delay(500); // Wait for servo to complete movement
-  
-  Serial.print("Servo rotated to: ");
-  Serial.println(targetPos);
-}
+// ========== ULTRASONIC SENSOR ==========
 
 int getDistance() {
   digitalWrite(ULTRASONIC_TRIG, LOW);
@@ -282,8 +474,12 @@ int getDistance() {
   delayMicroseconds(10);
   digitalWrite(ULTRASONIC_TRIG, LOW);
   
-  long duration = pulseIn(ULTRASONIC_ECHO, HIGH);
-  int distance = duration * 0.034 / 2;
+  long duration = pulseIn(ULTRASONIC_ECHO, HIGH, 30000);
   
+  if (duration == 0) {
+    return -1;
+  }
+  
+  int distance = duration * 0.034 / 2;
   return distance;
 }
